@@ -1,0 +1,19 @@
+{
+  "name": "e2e-runner",
+  "version": "1.0.0",
+  "description": "Runs Playwright .NET E2E tests per Jira card, stores results in SQLite, reports regressions and flakiness",
+  "type": "module",
+  "bin": {
+    "e2e": "./e2e.mjs"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^5.2.5"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "e2e": "node e2e.mjs"
+  }
+}
