@@ -206,10 +206,20 @@ async function doParallelRun(cfg, opts, card, database, requestedWorkers) {
       '--no-build',  // list-tests already compiled
     ];
     return spawnWorker('dotnet', args, { ...process.env, E2E_ENV: opts.env })
-      .then(({ code, stderr }) => ({ i, trxPath: join(workerDir, `${card}.trx`), code, stderr }));
+      .then(({ code, stderr }) => {
+        const elapsed = ((Date.now() - started.getTime()) / 1000).toFixed(0);
+        console.log(dim(`  worker ${i} done  (${elapsed}s elapsed)`));
+        return { i, trxPath: join(workerDir, `${card}.trx`), code, stderr };
+      });
   });
 
+  const heartbeat = setInterval(() => {
+    const elapsed = ((Date.now() - started.getTime()) / 1000).toFixed(0);
+    console.log(dim(`  ... still running  ${new Date().toISOString()}  (${elapsed}s)`));
+  }, 30_000);
+
   const workerResults = await Promise.all(workerJobs);
+  clearInterval(heartbeat);
   const elapsedSec = (Date.now() - started.getTime()) / 1000;
 
   // Aggregate TRX results from all workers.
