@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
 
 import { parseTrx, buildRerunFilter, fingerprint, normalizeError } from './src/trx.mjs';
+import { parseListTests, chunkTests, buildWorkerFilter, mergeWorkerResults } from './src/parallel.mjs';
 import * as db from './src/db.mjs';
 import { buildHtmlReport } from './src/report.mjs';
 import {
@@ -65,11 +66,29 @@ function gitInfo(cwd) {
 
 /* -------------------------------------------------------------------- run - */
 
-function doRun(cfg, opts) {
+function spawnWorker(cmd, args, env) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], env });
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d; });
+    proc.stdout.on('data', () => {});  // drain stdout to prevent backpressure
+    proc.on('error', reject);
+    proc.on('close', (code) => resolve({ code, stderr }));
+  });
+}
+
+async function doRun(cfg, opts) {
   const card = cardKey(opts.card);
   if (!card) fail('Give me a Jira card, e.g. `e2e run PANK-1835`.');
 
   const database = db.openDb(join(cfg.resultsRoot, 'e2e.db'));
+
+  const workersOpt = opts.workers != null ? Math.min(Math.max(parseInt(opts.workers, 10) || 1, 1), 10) : null;
+
+  // Parallel path: --workers N (N > 1) with no custom filter or rerun
+  if (workersOpt && workersOpt > 1 && !opts.filter && !opts.rerun) {
+    return doParallelRun(cfg, opts, card, database, workersOpt);
+  }
 
   let filter;
   if (opts.filter) {
@@ -106,11 +125,10 @@ function doRun(cfg, opts) {
   ];
   if (opts['no-build']) args.push('--no-build');
 
-  console.log(`\n${rule()}\n  ${bold(card)}  |  env=${opts.env}\n${rule()}`);
+  const started = new Date();
+  console.log(`\n${rule()}\n  ${bold(card)}  |  env=${opts.env}  |  ${dim(started.toISOString())}\n${rule()}`);
   console.log(dim(`  filter : ${filter}`));
   console.log(dim(`  project: ${cfg.project}\n`));
-
-  const started = new Date();
   const proc = spawnSync('dotnet', args, {
     stdio: 'inherit',
     env: { ...process.env, E2E_ENV: opts.env },
@@ -135,8 +153,94 @@ function doRun(cfg, opts) {
   }, results, fingerprint, normalizeError);
 
   report(database, runId, { card, env: opts.env, filter, elapsedSec, previous, cfg, opts });
+  console.log(dim(`  done: ${new Date().toISOString()}\n`));
   // Exit 3, not 0, when the filter matched nothing. An empty run is a naming
   // problem, not a pass, and callers must not read it as green.
+  process.exit(counts.failed > 0 ? 1 : counts.total === 0 ? 3 : 0);
+}
+
+async function doParallelRun(cfg, opts, card, database, requestedWorkers) {
+  if (!existsSync(cfg.project)) fail(`Project not found: ${cfg.project}`);
+
+  // Enumerate matching tests so we can split them into worker chunks.
+  const listArgs = [
+    'test', cfg.project,
+    '--filter', `FullyQualifiedName~${card}`,
+    '--list-tests',
+  ];
+  if (opts['no-build']) listArgs.push('--no-build');
+
+  const started = new Date();
+  console.log(`\n${rule()}\n  ${bold(card)}  |  env=${opts.env}  |  ${dim(started.toISOString())}\n${rule()}`);
+  console.log(dim('  enumerating tests...'));
+  const listProc = spawnSync('dotnet', listArgs, {
+    encoding: 'utf8',
+    env: { ...process.env, E2E_ENV: opts.env },
+  });
+  if (listProc.error) fail(`Could not start dotnet: ${listProc.error.message}`);
+
+  const testNames = parseListTests(listProc.stdout ?? '')
+    .filter((n) => n.toUpperCase().includes(card));
+  if (!testNames.length) {
+    console.log(yellow(`\n  No tests matched '${card}'.\n`));
+    process.exit(3);
+  }
+
+  const actualWorkers = Math.min(requestedWorkers, testNames.length);
+  const chunks = chunkTests(testNames, actualWorkers);
+  console.log(dim(`  ${testNames.length} test(s), ${actualWorkers} worker(s)\n`));
+
+  const previous = db.lastRun(database, card);
+  const runKey = runKeyNow();
+  const runDir = join(cfg.resultsRoot, card, runKey);
+  mkdirSync(runDir, { recursive: true });
+
+  const workerJobs = chunks.map((chunk, i) => {
+    const workerDir = join(runDir, `worker-${i}`);
+    mkdirSync(workerDir, { recursive: true });
+    const args = [
+      'test', cfg.project,
+      '--filter', buildWorkerFilter(chunk),
+      '--logger', `trx;LogFileName=${card}.trx`,
+      '--results-directory', workerDir,
+      '--no-build',  // list-tests already compiled
+    ];
+    return spawnWorker('dotnet', args, { ...process.env, E2E_ENV: opts.env })
+      .then(({ code, stderr }) => ({ i, trxPath: join(workerDir, `${card}.trx`), code, stderr }));
+  });
+
+  const workerResults = await Promise.all(workerJobs);
+  const elapsedSec = (Date.now() - started.getTime()) / 1000;
+
+  // Aggregate TRX results from all workers.
+  const payloads = [];
+  for (const { i, trxPath, code, stderr } of workerResults) {
+    if (!existsSync(trxPath)) {
+      console.log(red(`  Worker ${i} produced no TRX (exit ${code}).`));
+      if (stderr) console.log(dim(stderr.slice(0, 500)));
+    } else {
+      payloads.push(parseTrx(trxPath));
+    }
+  }
+
+  if (!payloads.length) {
+    console.log(red('\n  No TRX produced by any worker.\n'));
+    process.exit(2);
+  }
+
+  const { results, counts } = mergeWorkerResults(payloads);
+  const git = gitInfo(dirname(cfg.project));
+
+  const runId = db.insertRun(database, {
+    runKey, card, env: opts.env, filter: `FullyQualifiedName~${card}`,
+    startedAt: started.toISOString(),
+    elapsedSec, counts, trxPath: runDir,
+    gitSha: git.sha, gitBranch: git.branch,
+    workers: actualWorkers,
+  }, results, fingerprint, normalizeError);
+
+  report(database, runId, { card, env: opts.env, filter: `FullyQualifiedName~${card}`, elapsedSec, previous, cfg, opts });
+  console.log(dim(`  done: ${new Date().toISOString()}\n`));
   process.exit(counts.failed > 0 ? 1 : counts.total === 0 ? 3 : 0);
 }
 
@@ -364,7 +468,7 @@ const USAGE = `
   e2e - Playwright .NET E2E runner with result history
 
   e2e run <CARD> [--env qa] [--rerun] [--filter X] [--html] [--no-build]
-                 [--stack-lines N] [--short]
+                 [--stack-lines N] [--short] [--workers N]
   e2e last <CARD>              reprint the last run, no tests executed
   e2e history [CARD] [--runs N] [--flaky] [--env qa]
   e2e trend [CARD] [--runs N]
@@ -391,6 +495,7 @@ const { values, positionals } = parseArgs({
     html: { type: 'boolean' },
     short: { type: 'boolean' },
     'no-build': { type: 'boolean' },
+    workers: { type: 'string' },
     help: { type: 'boolean', short: 'h' },
   },
 });
@@ -403,7 +508,7 @@ if (values.help || !cmd) { console.log(USAGE); process.exit(0); }
 
 try {
   switch (cmd) {
-    case 'run': doRun(cfg, opts); break;
+    case 'run': await doRun(cfg, opts); break;
     case 'last': doLast(cfg, opts); break;
     case 'history': doHistory(cfg, opts); break;
     case 'trend': doTrend(cfg, opts); break;

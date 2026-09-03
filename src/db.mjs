@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS runs (
   skipped     INTEGER NOT NULL DEFAULT 0,
   git_sha     TEXT,
   git_branch  TEXT,
-  trx_path    TEXT
+  trx_path    TEXT,
+  workers     INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_runs_card ON runs(card, started_at);
 
@@ -84,6 +85,13 @@ export function openDb(dbPath) {
   db.exec('PRAGMA foreign_keys = ON');
   db.exec('PRAGMA busy_timeout = 5000');
   db.exec(SCHEMA);
+  // Migration: add workers column to existing v1 databases.
+  // CREATE TABLE IF NOT EXISTS is a no-op on existing tables, so we check
+  // the column list rather than relying on schema_version alone.
+  const cols = db.prepare('PRAGMA table_info(runs)').all();
+  if (!cols.find((c) => c.name === 'workers')) {
+    db.exec('ALTER TABLE runs ADD COLUMN workers INTEGER');
+  }
   db.prepare('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)')
     .run('schema_version', String(SCHEMA_VERSION));
   return db;
@@ -117,12 +125,14 @@ export function insertRun(db, run, results, fingerprintFn, normalizeFn) {
   const tx = () => {
     const info = db.prepare(`
       INSERT INTO runs(run_key, card, env, filter, started_at, elapsed_sec,
-                       total, passed, failed, skipped, git_sha, git_branch, trx_path)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       total, passed, failed, skipped, git_sha, git_branch, trx_path,
+                       workers)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       run.runKey, run.card, run.env, run.filter, run.startedAt, run.elapsedSec,
       run.counts.total, run.counts.passed, run.counts.failed, run.counts.skipped,
       run.gitSha, run.gitBranch, run.trxPath,
+      run.workers ?? null,
     );
     const runId = Number(info.lastInsertRowid);
 

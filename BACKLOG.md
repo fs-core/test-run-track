@@ -1,11 +1,5 @@
 # Backlog
 
-## Parallel workers
-
-Add `--workers N` flag to `e2e run`. Enumerate tests first via `dotnet test --list-tests`, split into N equal chunks, run N `dotnet test` processes in parallel via `Promise.all`, aggregate TRX results into one logical run. Add nullable `workers` column to `runs` table (null = sequential). Schema bump + migration.
-
-Default N: `Math.ceil(testCount / 13)`, capped at 10.
-
 ## Duration-aware worker grouping
 
 Second pass after parallel workers ship. Bin tests by historical `duration_ms` rather than count, so wall-clock time is balanced across workers. Requires accumulated run data — implement once there are enough parallel runs to work with.

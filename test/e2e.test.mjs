@@ -1,12 +1,14 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 
 import {
   parseTrx, buildRerunFilter, fingerprint, normalizeError, durationToMs,
 } from '../src/trx.mjs';
+import { parseListTests, chunkTests, buildWorkerFilter, mergeWorkerResults } from '../src/parallel.mjs';
 import * as db from '../src/db.mjs';
 import { classify } from '../src/render.mjs';
 import {
@@ -168,6 +170,85 @@ describe('classify', () => {
   });
 });
 
+/* --------------------------------------------------------------- parallel - */
+
+describe('parseListTests', () => {
+  test('extracts test names after the marker', () => {
+    const out = [
+      'Build started, please wait...',
+      'The following Tests are available:',
+      '    Ns.Cls.MethodA',
+      '    Ns.Cls.MethodB',
+      '',
+    ].join('\n');
+    assert.deepEqual(parseListTests(out), ['Ns.Cls.MethodA', 'Ns.Cls.MethodB']);
+  });
+
+  test('returns empty when marker is absent', () => {
+    assert.deepEqual(parseListTests('Build failed.\nNo output.'), []);
+  });
+
+  test('handles CRLF line endings', () => {
+    const out = 'The following Tests are available:\r\n    A.B.C\r\n';
+    assert.deepEqual(parseListTests(out), ['A.B.C']);
+  });
+
+  test('returns empty on null/undefined input', () => {
+    assert.deepEqual(parseListTests(null), []);
+    assert.deepEqual(parseListTests(undefined), []);
+  });
+});
+
+describe('chunkTests', () => {
+  test('splits 13 tests into 3 even-ish chunks', () => {
+    const tests = Array.from({ length: 13 }, (_, i) => `T${i}`);
+    const chunks = chunkTests(tests, 3);
+    assert.equal(chunks.length, 3);
+    assert.equal(chunks[0].length, 5);
+    assert.equal(chunks[1].length, 5);
+    assert.equal(chunks[2].length, 3);
+    assert.equal(chunks.flat().length, 13);
+  });
+
+  test('returns one chunk when n=1', () => {
+    const tests = ['A', 'B', 'C'];
+    assert.deepEqual(chunkTests(tests, 1), [['A', 'B', 'C']]);
+  });
+
+  test('caps at test count when n exceeds number of tests', () => {
+    const chunks = chunkTests(['A', 'B'], 5);
+    assert.equal(chunks.length, 2);
+    assert.deepEqual(chunks.flat(), ['A', 'B']);
+  });
+
+  test('returns one chunk for an empty list', () => {
+    assert.deepEqual(chunkTests([], 4), [[]]);
+  });
+});
+
+describe('buildWorkerFilter', () => {
+  test('joins names with pipe and FullyQualifiedName~ prefix', () => {
+    assert.equal(
+      buildWorkerFilter(['Ns.Cls.A', 'Ns.Cls.B']),
+      'FullyQualifiedName~Ns.Cls.A|FullyQualifiedName~Ns.Cls.B',
+    );
+  });
+
+  test('single name has no pipe', () => {
+    assert.equal(buildWorkerFilter(['Ns.Cls.A']), 'FullyQualifiedName~Ns.Cls.A');
+  });
+});
+
+describe('mergeWorkerResults', () => {
+  test('aggregates results and counts from multiple payloads', () => {
+    const p1 = { results: [{ outcome: 'Passed' }], counts: { total: 1, passed: 1, failed: 0, skipped: 0 } };
+    const p2 = { results: [{ outcome: 'Failed' }, { outcome: 'Passed' }], counts: { total: 2, passed: 1, failed: 1, skipped: 0 } };
+    const { results, counts } = mergeWorkerResults([p1, p2]);
+    assert.equal(results.length, 3);
+    assert.deepEqual(counts, { total: 3, passed: 2, failed: 1, skipped: 0 });
+  });
+});
+
 /* --------------------------------------------------------------------- db - */
 
 describe('database', () => {
@@ -191,10 +272,12 @@ describe('database', () => {
       }, results, fingerprint, normalizeError);
     });
   });
+  after(() => { try { database.close(); } catch {} });
 
   test('openDb is idempotent', () => {
     const again = db.openDb(join(dir, 'db', 'e2e.db'));
     assert.ok(again.prepare('SELECT count(*) c FROM runs').get().c > 0);
+    again.close();
   });
 
   test('records every run', () => {
@@ -255,5 +338,49 @@ describe('database', () => {
     const prev = db.lastRun(database, 'PANK1835', last.run_key);
     assert.notEqual(prev.run_key, last.run_key);
     assert.equal(prev.git_sha, 'e5f6a7b');
+  });
+
+  test('workers column is stored and queried; null for sequential runs', () => {
+    // Insert a parallel run
+    const { results, counts } = parseTrx(writeTrx('par', SCENARIO[0]));
+    db.insertRun(database, {
+      runKey: '20260910-120000', card: 'PANK1835', env: 'qa',
+      filter: 'FullyQualifiedName~PANK1835',
+      startedAt: new Date(Date.UTC(2026, 8, 10, 12)).toISOString(),
+      elapsedSec: 60, counts, trxPath: '/tmp/par',
+      gitSha: null, gitBranch: null,
+      workers: 4,
+    }, results, fingerprint, normalizeError);
+
+    const parallel = db.runByKey(database, '20260910-120000');
+    assert.equal(parallel.workers, 4);
+
+    // Sequential runs written in before() have no workers field → null
+    const sequential = db.runByKey(database, '20260901-120000');
+    assert.equal(sequential.workers, null);
+  });
+
+  test('openDb migrates an existing DB without the workers column', () => {
+    // Build a v1-style DB: create it, drop the workers column via recreation.
+    const migrateDbPath = join(dir, 'migrate', 'e2e.db');
+    mkdirSync(dirname(migrateDbPath), { recursive: true });
+    const raw = new DatabaseSync(migrateDbPath);
+    raw.exec(`CREATE TABLE runs (
+      id INTEGER PRIMARY KEY, run_key TEXT NOT NULL UNIQUE,
+      card TEXT NOT NULL, env TEXT NOT NULL, filter TEXT,
+      started_at TEXT NOT NULL DEFAULT '', elapsed_sec REAL,
+      total INTEGER NOT NULL DEFAULT 0, passed INTEGER NOT NULL DEFAULT 0,
+      failed INTEGER NOT NULL DEFAULT 0, skipped INTEGER NOT NULL DEFAULT 0,
+      git_sha TEXT, git_branch TEXT, trx_path TEXT
+    )`);
+    raw.exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)`);
+    raw.prepare(`INSERT INTO meta VALUES ('schema_version', '1')`).run();
+    raw.close();
+
+    // openDb should add workers without throwing
+    const migrated = db.openDb(migrateDbPath);
+    const cols = migrated.prepare('PRAGMA table_info(runs)').all().map((c) => c.name);
+    migrated.close();
+    assert.ok(cols.includes('workers'), 'workers column should exist after migration');
   });
 });
