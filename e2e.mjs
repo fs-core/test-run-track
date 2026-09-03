@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
 
 import { parseTrx, buildRerunFilter, fingerprint, normalizeError } from './src/trx.mjs';
-import { parseListTests, chunkTests, buildWorkerFilter, mergeWorkerResults } from './src/parallel.mjs';
+import { parseListTests, chunkByClass, buildWorkerFilter, mergeWorkerResults } from './src/parallel.mjs';
 import * as db from './src/db.mjs';
 import { buildHtmlReport } from './src/report.mjs';
 import {
@@ -186,9 +186,9 @@ async function doParallelRun(cfg, opts, card, database, requestedWorkers) {
     process.exit(3);
   }
 
-  const actualWorkers = Math.min(requestedWorkers, testNames.length);
-  const chunks = chunkTests(testNames, actualWorkers);
-  console.log(dim(`  ${testNames.length} test(s), ${actualWorkers} worker(s)\n`));
+  const chunks = chunkByClass(testNames, requestedWorkers);
+  const actualWorkers = chunks.length;
+  console.log(dim(`  ${testNames.length} test(s), ${actualWorkers} worker(s) (grouped by class)\n`));
 
   const previous = db.lastRun(database, card);
   const runKey = runKeyNow();

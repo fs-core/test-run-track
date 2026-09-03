@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import {
   parseTrx, buildRerunFilter, fingerprint, normalizeError, durationToMs,
 } from '../src/trx.mjs';
-import { parseListTests, chunkTests, buildWorkerFilter, mergeWorkerResults } from '../src/parallel.mjs';
+import { parseListTests, chunkTests, chunkByClass, buildWorkerFilter, mergeWorkerResults } from '../src/parallel.mjs';
 import * as db from '../src/db.mjs';
 import { classify } from '../src/render.mjs';
 import {
@@ -223,6 +223,40 @@ describe('chunkTests', () => {
 
   test('returns one chunk for an empty list', () => {
     assert.deepEqual(chunkTests([], 4), [[]]);
+  });
+});
+
+describe('chunkByClass', () => {
+  test('keeps all tests from the same class in the same worker', () => {
+    const names = [
+      'Ns.ClsA.Test1', 'Ns.ClsA.Test2',
+      'Ns.ClsB.Test1', 'Ns.ClsB.Test2',
+      'Ns.ClsC.Test1',
+    ];
+    const chunks = chunkByClass(names, 4);
+    for (const chunk of chunks) {
+      const classes = new Set(chunk.map((n) => n.slice(0, n.lastIndexOf('.'))));
+      assert.equal(classes.size, 1, 'each worker must contain only one class');
+    }
+  });
+
+  test('caps worker count at number of classes', () => {
+    const names = ['A.T1', 'A.T2', 'B.T1'];
+    const chunks = chunkByClass(names, 10);
+    assert.equal(chunks.length, 2);
+  });
+
+  test('all tests present across workers', () => {
+    const names = ['A.T1', 'A.T2', 'B.T1', 'C.T1', 'C.T2', 'C.T3'];
+    const chunks = chunkByClass(names, 3);
+    assert.deepEqual(chunks.flat().sort(), names.sort());
+  });
+
+  test('returns one worker when n=1', () => {
+    const names = ['A.T1', 'B.T1'];
+    const chunks = chunkByClass(names, 1);
+    assert.equal(chunks.length, 1);
+    assert.equal(chunks[0].length, 2);
   });
 });
 

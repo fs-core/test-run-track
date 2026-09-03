@@ -34,6 +34,32 @@ export function chunkTests(names, n) {
 }
 
 /**
+ * Distributes tests across N workers by class, keeping every test from the
+ * same class in the same worker. Prevents concurrent OneTimeSetUp conflicts
+ * when NUnit fixture setup inserts shared DB rows.
+ *
+ * Classes are assigned round-robin so workers stay roughly balanced by class
+ * count. Returns at most min(n, classCount) non-empty worker arrays.
+ */
+export function chunkByClass(names, n) {
+  if (names.length === 0) return [[]];
+  const byClass = new Map();
+  for (const name of names) {
+    const cls = name.includes('.') ? name.slice(0, name.lastIndexOf('.')) : name;
+    if (!byClass.has(cls)) byClass.set(cls, []);
+    byClass.get(cls).push(name);
+  }
+  const workerCount = Math.min(n, byClass.size);
+  const workers = Array.from({ length: workerCount }, () => []);
+  let i = 0;
+  for (const tests of byClass.values()) {
+    workers[i % workerCount].push(...tests);
+    i++;
+  }
+  return workers;
+}
+
+/**
  * Builds a `FullyQualifiedName~` OR filter for one worker's chunk of tests.
  */
 export function buildWorkerFilter(names) {
