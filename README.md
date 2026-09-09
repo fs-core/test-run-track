@@ -37,18 +37,28 @@ e2e run PANK-1835                 run the card's tests
 e2e run PANK-1835 --rerun         run only what failed last time
 e2e run PANK-1835 --env staging   override E2E_ENV
 e2e run PANK-1835 --html          also write an HTML report
+e2e run PANK-1835 --workers 4     run the card's tests in parallel
+e2e status PANK-1835              every known test, and when it last passed
 e2e last PANK-1835                reprint the last run, execute nothing
 e2e history PANK-1835             per-test pass/fail record
 e2e history --flaky               flaky tests across all cards
 e2e trend PANK-1835               run-over-run counts with git shas
 e2e why PANK-1835 --test BulkTag  last-pass / first-fail commit range
 e2e clusters PANK-1835            failures grouped by error signature
+e2e clusters PANK-1835 --run KEY  clusters for one specific run
 e2e slow PANK-1835                slowest tests by average duration
 ```
 
 Flags: `--runs N` (history window, default 20), `--stack-lines N` (0 = all),
 `--filter X` (bypass card matching), `--short` (use `Class.Method` in the rerun
-filter instead of the full namespace), `--no-build`.
+filter instead of the full namespace), `--no-build`, `--env X` (also filters
+`history` and `status`), `--all` (`status` only — every env, not just the
+configured one).
+
+`--workers N` splits the card's tests across N `dotnet test` processes (capped at
+10), chunked by class so `OneTimeSetUp` never runs twice concurrently for the same
+fixture. It is ignored when combined with `--filter` or `--rerun`, both of which
+take the single-process path.
 
 Exit codes: `0` all clear, `1` failures, `2` build/config problem, `3` filter matched no tests.
 
