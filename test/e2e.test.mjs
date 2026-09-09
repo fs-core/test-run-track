@@ -10,9 +10,9 @@ import {
 } from '../src/trx.mjs';
 import { parseListTests, chunkTests, chunkByClass, buildWorkerFilter, mergeWorkerResults } from '../src/parallel.mjs';
 import * as db from '../src/db.mjs';
-import { classify } from '../src/render.mjs';
+import { classify, fmtAgo } from '../src/render.mjs';
 import {
-  makeTrx, makeSingleTestTrx, makeInnerResultsTrx, SCENARIO, CLASS_NAME,
+  makeTrx, makeSingleTestTrx, makeInnerResultsTrx, SCENARIO, STATUS_SCENARIO, CLASS_NAME,
 } from './fixtures.mjs';
 
 let dir;
@@ -416,5 +416,120 @@ describe('database', () => {
     const cols = migrated.prepare('PRAGMA table_info(runs)').all().map((c) => c.name);
     migrated.close();
     assert.ok(cols.includes('workers'), 'workers column should exist after migration');
+  });
+});
+
+/* --------------------------------------------------------------- status --- */
+
+describe('fmtAgo', () => {
+  const now = Date.parse('2026-09-10T12:00:00.000Z');
+  const ago = (iso) => fmtAgo(iso, now);
+
+  test('scales from minutes to months', () => {
+    assert.equal(ago('2026-09-10T11:59:40.000Z'), 'just now');
+    assert.equal(ago('2026-09-10T11:46:00.000Z'), '14m ago');
+    assert.equal(ago('2026-09-10T06:00:00.000Z'), '6h ago');
+    assert.equal(ago('2026-09-07T12:00:00.000Z'), '3d ago');
+    assert.equal(ago('2026-05-10T12:00:00.000Z'), '4mo ago');
+  });
+
+  test('null and junk render as a dash, not NaN', () => {
+    assert.equal(ago(null), '-');
+    assert.equal(ago(undefined), '-');
+    assert.equal(ago('not a date'), '-');
+  });
+});
+
+describe('cardStatus', () => {
+  let database;
+  const AT = (i) => new Date(Date.UTC(2026, 8, i + 1, 12)).toISOString();
+  // short_name is 'Class.Method'; these tests only care about the method.
+  const method = (t) => t.short_name.split('.').pop();
+  let byName;
+
+  before(() => {
+    const dbDir = join(dir, 'status');
+    mkdirSync(dbDir, { recursive: true });
+    database = db.openDb(join(dbDir, 'e2e.db'));
+    STATUS_SCENARIO.forEach((xml, i) => {
+      const p = writeTrx(`status${i}`, xml);
+      const { results, counts } = parseTrx(p);
+      db.insertRun(database, {
+        runKey: `2026090${i + 1}-090000`, card: 'PANK2000', env: 'qa',
+        filter: 'FullyQualifiedName~PANK2000', startedAt: AT(i),
+        elapsedSec: 60, counts, trxPath: p,
+        gitSha: `sha0000${i}`, gitBranch: 'main',
+      }, results, fingerprint, normalizeError);
+    });
+    byName = Object.fromEntries(
+      db.cardStatus(database, 'PANK2000', 'qa').tests.map((t) => [method(t), t]),
+    );
+  });
+  after(() => { try { database.close(); } catch {} });
+
+  test('v_run_test separates a skipped test from a passing one', () => {
+    const row = database.prepare(`
+      SELECT v.failed, v.any_passed FROM v_run_test v
+      JOIN runs r ON r.id = v.run_id JOIN tests t ON t.id = v.test_id
+      WHERE r.run_key = ? AND t.short_name LIKE ?
+    `).get('20260903-090000', '%.SkippedLast');
+    assert.equal(row.failed, 0);
+    assert.equal(row.any_passed, 0, 'a skipped case is not a pass');
+  });
+
+  test('reports every test the card has ever run, not just the newest run', () => {
+    assert.equal(Object.keys(byName).length, 5);
+    assert.ok(byName.DroppedFromSuite, 'a test missing from the newest run must still appear');
+  });
+
+  test('a test absent from the newest run is absent, not its stale outcome', () => {
+    assert.equal(byName.DroppedFromSuite.current, 'absent');
+    assert.equal(byName.DroppedFromSuite.last_pass_at, AT(1));
+    assert.equal(byName.DroppedFromSuite.runs_seen, 2);
+  });
+
+  test('last pass ignores runs where the test was skipped', () => {
+    assert.equal(byName.SkippedLast.current, 'skip');
+    assert.equal(byName.SkippedLast.last_pass_at, AT(1),
+      'run 3 skipped it, so the last genuine pass is run 2');
+    assert.equal(byName.SkippedLast.pass_runs, 2, 'a skipped run is not a passing run');
+    assert.equal(byName.SkippedLast.fail_runs, 0);
+    assert.equal(byName.SkippedLast.runs_seen, 3);
+  });
+
+  test('last pass tracks the newest green run', () => {
+    assert.equal(byName.StableOne.current, 'pass');
+    assert.equal(byName.StableOne.last_pass_at, AT(2));
+    assert.equal(byName.StableOne.last_pass_run, '20260903-090000');
+    assert.equal(byName.StableOne.last_pass_sha, 'sha00002');
+  });
+
+  test('a regression keeps the timestamp of the last run before it broke', () => {
+    assert.equal(byName.BrokeAtTwo.current, 'fail');
+    assert.equal(byName.BrokeAtTwo.last_pass_at, AT(0));
+    assert.equal(byName.BrokeAtTwo.fail_runs, 2);
+  });
+
+  test('a test that never passed has a null last pass', () => {
+    assert.equal(byName.NeverGreen.current, 'fail');
+    assert.equal(byName.NeverGreen.last_pass_at, null);
+    assert.equal(byName.NeverGreen.fail_runs, 3);
+  });
+
+  test('orders failing first, then absent, then skipped, then passing', () => {
+    const order = db.cardStatus(database, 'PANK2000', 'qa').tests.map(method);
+    assert.deepEqual(order, [
+      'NeverGreen', 'BrokeAtTwo', 'DroppedFromSuite', 'SkippedLast', 'StableOne',
+    ]);
+  });
+
+  test('env scoping and an unknown card both yield no latest run', () => {
+    assert.equal(db.cardStatus(database, 'PANK2000', 'prod').latest, null);
+    assert.equal(db.cardStatus(database, 'NOSUCHCARD', null).latest, null);
+    assert.deepEqual(db.cardStatus(database, 'NOSUCHCARD', null).tests, []);
+  });
+
+  test('a null env spans every environment', () => {
+    assert.equal(db.cardStatus(database, 'PANK2000', null).tests.length, 5);
   });
 });

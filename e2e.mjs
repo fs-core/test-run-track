@@ -12,7 +12,7 @@ import * as db from './src/db.mjs';
 import { buildHtmlReport } from './src/report.mjs';
 import {
   red, green, yellow, blue, magenta, cyan, dim, bold,
-  rule, thin, pad, indent, fmtElapsed, classify, verdictColor,
+  rule, thin, pad, indent, fmtElapsed, fmtAgo, classify, verdictColor,
 } from './src/render.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -449,6 +449,51 @@ function doClusters(cfg, opts) {
   console.log('');
 }
 
+const STATUS_COLOR = { pass: green, fail: red, skip: yellow, absent: magenta };
+
+function doStatus(cfg, opts) {
+  const database = db.openDb(join(cfg.resultsRoot, 'e2e.db'));
+  const card = cardKey(opts.card);
+  if (!card) fail('Give me a Jira card, e.g. `e2e status PANK-1835`.');
+
+  const env = opts.all ? null : (opts.env ?? null);
+  const { latest, tests } = db.cardStatus(database, card, env);
+  if (!latest) return console.log(yellow(`\n  No runs recorded for ${card}.\n`));
+
+  const count = (s) => tests.filter((t) => t.current === s).length;
+  const failing = count('fail');
+  const absent = count('absent');
+  const never = tests.filter((t) => !t.last_pass_at).length;
+
+  const verdict = failing ? `${failing} FAILING` : absent ? `${absent} NOT IN LAST RUN` : 'ALL CLEAR';
+  const paint = failing ? red : absent ? yellow : green;
+
+  console.log(`\n${rule()}\n  ${bold(`STATUS  ${card}`)}\n${rule()}\n`);
+  console.log(`  ${paint(bold(verdict))}`);
+  console.log(dim(`  ${tests.length} test(s) known   ${count('pass')} passing   ${failing} failing   ` +
+    `${count('skip')} skipped   ${absent} absent   ${never} never passed`));
+  console.log(dim(`  latest run ${latest.run_key}  ${fmtAgo(latest.started_at)}` +
+    `${latest.git_sha ? `  ${latest.git_sha}` : ''}   env ${env ?? 'any'}`));
+
+  console.log(`\n  ${dim(`${pad('TEST', 46)} ${pad('NOW', 7)} ${pad('LAST PASSED', 17)} ` +
+    `${pad('AGE', 9)} PASS/RUNS`)}`);
+  console.log(`  ${dim('-'.repeat(94))}`);
+  for (const t of tests) {
+    const row = STATUS_COLOR[t.current] ?? dim;
+    const when = t.last_pass_at ? t.last_pass_at.slice(0, 16).replace('T', ' ') : 'never';
+    console.log(`  ${row(pad(t.short_name, 46))} ${row(pad(t.current, 7))} ` +
+      `${(t.last_pass_at ? dim : yellow)(pad(when, 17))} ` +
+      `${dim(pad(t.last_pass_at ? fmtAgo(t.last_pass_at) : '-', 9))} ` +
+      dim(`${t.pass_runs}/${t.runs_seen}`));
+  }
+
+  if (absent) {
+    console.log(dim(`\n  'absent' = recorded for this card before, but not in ${latest.run_key}.` +
+      `\n  Check the filter still matches it - a renamed test reads as absent, not as a failure.`));
+  }
+  console.log('');
+}
+
 function doSlow(cfg, opts) {
   const database = db.openDb(join(cfg.resultsRoot, 'e2e.db'));
   const rows = db.slowestTests(database, opts.card ? cardKey(opts.card) : null, Number(opts.runs ?? 10));
@@ -479,6 +524,7 @@ const USAGE = `
 
   e2e run <CARD> [--env qa] [--rerun] [--filter X] [--html] [--no-build]
                  [--stack-lines N] [--short] [--workers N]
+  e2e status <CARD> [--all]    every test on the card + when it last passed
   e2e last <CARD>              reprint the last run, no tests executed
   e2e history [CARD] [--runs N] [--flaky] [--env qa]
   e2e trend [CARD] [--runs N]
@@ -502,6 +548,7 @@ const { values, positionals } = parseArgs({
     'stack-lines': { type: 'string' },
     rerun: { type: 'boolean' },
     flaky: { type: 'boolean' },
+    all: { type: 'boolean' },
     html: { type: 'boolean' },
     short: { type: 'boolean' },
     'no-build': { type: 'boolean' },
@@ -519,6 +566,7 @@ if (values.help || !cmd) { console.log(USAGE); process.exit(0); }
 try {
   switch (cmd) {
     case 'run': await doRun(cfg, opts); break;
+    case 'status': doStatus(cfg, opts); break;
     case 'last': doLast(cfg, opts); break;
     case 'history': doHistory(cfg, opts); break;
     case 'trend': doTrend(cfg, opts); break;

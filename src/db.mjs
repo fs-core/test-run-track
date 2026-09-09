@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -66,12 +66,23 @@ CREATE INDEX IF NOT EXISTS ix_results_run   ON results(run_id);
 CREATE INDEX IF NOT EXISTS ix_results_test  ON results(test_id);
 CREATE INDEX IF NOT EXISTS ix_results_error ON results(error_id);
 
--- Collapses data-driven cases: a test counts as failed in a run if any of
--- its cases failed.
-CREATE VIEW IF NOT EXISTS v_run_test AS
+`;
+
+// Collapses data-driven cases: a test counts as failed in a run if any case
+// failed, and as passed only if a case actually ran green. Those are not
+// complements - a wholly skipped test is neither, so `failed = 0` alone does
+// not mean "passed".
+//
+// Recreated on every open rather than CREATE VIEW IF NOT EXISTS: a view holds
+// no data, so dropping costs nothing, and it means an older database can never
+// be left running a stale definition of it.
+const V_RUN_TEST = `
+DROP VIEW IF EXISTS v_run_test;
+CREATE VIEW v_run_test AS
 SELECT run_id,
        test_id,
        MAX(CASE WHEN outcome = 'Failed' THEN 1 ELSE 0 END) AS failed,
+       MAX(CASE WHEN outcome = 'Passed' THEN 1 ELSE 0 END) AS any_passed,
        COUNT(*)                                            AS cases,
        SUM(COALESCE(duration_ms, 0))                       AS duration_ms
 FROM results
@@ -85,6 +96,7 @@ export function openDb(dbPath) {
   db.exec('PRAGMA foreign_keys = ON');
   db.exec('PRAGMA busy_timeout = 5000');
   db.exec(SCHEMA);
+  db.exec(V_RUN_TEST);
   // Migration: add workers column to existing v1 databases.
   // CREATE TABLE IF NOT EXISTS is a no-op on existing tables, so we check
   // the column list rather than relying on schema_version alone.
@@ -288,6 +300,74 @@ export function regressionWindow(db, fullName, card) {
   `).get(fullName, card, card, lastPass.started_at);
 
   return { lastPass, firstFail: firstFail ?? null };
+}
+
+/**
+ * Every test ever recorded under a card, with the last run it genuinely passed
+ * in.
+ *
+ * Two deliberate choices. The row set is every test the card has ever seen, not
+ * the newest run's tests: one that quietly stopped matching the filter would
+ * otherwise vanish from the report entirely, which is the exact failure this is
+ * meant to catch. And such a test reads 'absent' rather than carrying its last
+ * known outcome forward, because a test that did not run is neither passing nor
+ * failing.
+ */
+export function cardStatus(db, card, env = null) {
+  const latest = db.prepare(`
+    SELECT id, run_key, started_at, git_sha, git_branch FROM runs
+    WHERE card = ? AND (? IS NULL OR env = ?)
+    ORDER BY started_at DESC, id DESC
+    LIMIT 1
+  `).get(card, env, env) ?? null;
+  if (!latest) return { latest: null, tests: [] };
+
+  const tests = db.prepare(`
+    WITH scoped AS (
+      SELECT id, run_key, started_at, git_sha FROM runs
+      WHERE card = ? AND (? IS NULL OR env = ?)
+    ),
+    agg AS (
+      SELECT v.test_id,
+             COUNT(*)      AS runs_seen,
+             SUM(v.failed) AS fail_runs,
+             SUM(CASE WHEN v.failed = 0 AND v.any_passed = 1 THEN 1 ELSE 0 END) AS pass_runs,
+             MAX(s.started_at) AS last_seen_at
+      FROM v_run_test v
+      JOIN scoped s ON s.id = v.run_id
+      GROUP BY v.test_id
+    ),
+    passes AS (
+      SELECT v.test_id, s.run_key, s.started_at, s.git_sha,
+             ROW_NUMBER() OVER (PARTITION BY v.test_id
+                                ORDER BY s.started_at DESC, s.id DESC) AS rn
+      FROM v_run_test v
+      JOIN scoped s ON s.id = v.run_id
+      WHERE v.failed = 0 AND v.any_passed = 1
+    )
+    SELECT t.full_name, t.short_name,
+           a.runs_seen, a.fail_runs, a.pass_runs, a.last_seen_at,
+           p.started_at AS last_pass_at,
+           p.run_key    AS last_pass_run,
+           p.git_sha    AS last_pass_sha,
+           CASE WHEN cur.test_id IS NULL THEN 'absent'
+                WHEN cur.failed = 1      THEN 'fail'
+                WHEN cur.any_passed = 1  THEN 'pass'
+                ELSE 'skip' END AS current
+    FROM agg a
+    JOIN tests t ON t.id = a.test_id
+    LEFT JOIN passes p     ON p.test_id = a.test_id AND p.rn = 1
+    LEFT JOIN v_run_test cur ON cur.test_id = a.test_id AND cur.run_id = ?
+    ORDER BY CASE WHEN cur.test_id IS NULL THEN 1
+                  WHEN cur.failed = 1      THEN 0
+                  WHEN cur.any_passed = 1  THEN 3
+                  ELSE 2 END,
+             p.started_at IS NOT NULL,
+             p.started_at ASC,
+             t.full_name
+  `).all(card, env, env, latest.id);
+
+  return { latest, tests };
 }
 
 export function slowestTests(db, card, limit = 10) {

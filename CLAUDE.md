@@ -17,7 +17,7 @@ Everything downstream of it is covered by synthetic TRX fixtures:
 npm test
 ```
 
-**Run this before you start and after every change.** 29 tests, under a second.
+**Run this before you start and after every change.** 58 tests, under a second.
 If you change parsing, fingerprinting, filter building, verdicts, or SQL, the
 suite is the only thing standing between a subtle break and the human finding
 out three weeks later that reruns silently match nothing.
@@ -58,7 +58,15 @@ behaviour, stop and ask.
 5. **Error normalization must mask numbers with unit suffixes.** `\b\d+\b` does
    not match `30000` in `30000ms` — there is no word boundary between a digit and
    a letter. This was a live bug; the current pattern has no `\b` for that reason.
-6. **`classify()` counts transitions, not failure rate.** `.X.X.X` and `...XXX`
+6. **`failed = 0` does not mean passed.** A wholly skipped test also has
+   `failed = 0`, so "when did this last pass" must test `failed = 0 AND
+   any_passed = 1`. Getting this wrong reports a skipped run as a green one,
+   which is the single most misleading thing this tool could say.
+7. **`v_run_test` is dropped and recreated on every `openDb`.** It is derived
+   data, so this costs nothing and makes it impossible for an older database to
+   run a stale definition of the view. Do not switch it back to
+   `CREATE VIEW IF NOT EXISTS`.
+8. **`classify()` counts transitions, not failure rate.** `.X.X.X` and `...XXX`
    are both 50% failures but are a flake and a regression respectively. That
    distinction is the main reason this tool exists.
 

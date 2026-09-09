@@ -42,6 +42,22 @@ export function fmtElapsed(sec) {
   return m ? `${m}m ${s}s` : `${s}s`;
 }
 
+/** Compact relative age: 'just now', '14m ago', '6h ago', '3d ago', '4mo ago'. */
+export function fmtAgo(iso, now = Date.now()) {
+  if (!iso) return '-';
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return '-';
+  const sec = Math.max(0, Math.round((now - then) / 1000));
+  if (sec < 60) return 'just now';
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 60) return `${day}d ago`;
+  return `${Math.floor(day / 30)}mo ago`;
+}
+
 /**
  * Turns a pass/fail sequence into a verdict. Transitions matter more than the
  * raw failure rate: '..X..X..X.' is flaky, while '....XXXXXX' is a test that

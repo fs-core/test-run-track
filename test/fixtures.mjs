@@ -120,6 +120,21 @@ export const SCENARIO = (() => {
   ));
 })();
 
+/**
+ * Three runs for the card-status tests, covering the five states a test can be
+ * in by the newest run: still green, broken partway through, never green,
+ * skipped in the newest run, and dropped from the suite entirely (present in
+ * runs 1-2, absent from run 3).
+ */
+export const STATUS_SCENARIO = (() => {
+  const P = 'Passed', F = 'Failed', S = 'NotExecuted';
+  return [
+    [['StableOne', P], ['BrokeAtTwo', P], ['NeverGreen', F], ['SkippedLast', P], ['DroppedFromSuite', P]],
+    [['StableOne', P], ['BrokeAtTwo', F], ['NeverGreen', F], ['SkippedLast', P], ['DroppedFromSuite', P]],
+    [['StableOne', P], ['BrokeAtTwo', F], ['NeverGreen', F], ['SkippedLast', S]],
+  ].map((row) => makeTrx(row.map(([name, outcome]) => ({ name, outcome }))));
+})();
+
 export const SCENARIO_NAMES = [
   'GridSortsByLastGift', 'BulkTagApplies', 'DonorExportRespectsFilter',
   'PledgeScheduleRenders', 'SoftCreditSplitSaves',
